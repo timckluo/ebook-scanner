@@ -13,12 +13,18 @@ Single-file Python tool (`ebook_scanner.py`) that:
 ## Running it
 
 ```bash
+# Step 1: scan & index all ebooks
 python3 ebook_scanner.py
+
+# Step 2: find content-based duplicates (byte-different, same content)
+python3 content_dedup.py
 ```
 
-The script is resumable — files already in `books.db` are skipped. Re-run freely after adding books or after `updatedb` runs.
+Both scripts are resumable — already-processed files are skipped.
 
-## Key constants (top of ebook_scanner.py)
+## Key constants
+
+### ebook_scanner.py
 
 | Constant | Default | Purpose |
 |---|---|---|
@@ -29,8 +35,9 @@ The script is resumable — files already in `books.db` are skipped. Re-run free
 
 ## Output files (not committed to git)
 
-- `books.db` — SQLite; tables `books` and `duplicates`
-- `duplicates.txt` — one group per SHA-256, listing all duplicate paths
+- `books.db` — SQLite; tables `books`, `duplicates`, `fuzzy_duplicates`
+- `duplicates.txt` — byte-identical duplicates grouped by SHA-256
+- `fuzzy_duplicates.txt` — content-identical duplicates (different bytes, same text)
 - `report.txt` — counts by format, category, and top authors
 
 ## Dependencies
@@ -38,6 +45,24 @@ The script is resumable — files already in `books.db` are skipped. Re-run free
 - Python 3.10+ (stdlib only — no pip installs needed)
 - `calibre` — provides `ebook-meta` (`dnf install calibre`)
 - `plocate` — provides `locate` (`dnf install mlocate`)
+
+### content_dedup.py
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `MAX_WORKERS` | 16 | Parallel extraction threads |
+| `SAMPLE_CHARS` | 3000 | Characters extracted per book |
+| `FUZZY_THRESH` | 0.85 | SequenceMatcher ratio to call a match |
+| `ISBN_TEXT_SIM` | 0.75 | Min text similarity to confirm an ISBN match |
+| `ISBN_TITLE_SIM` | 0.70 | Min title similarity to confirm an ISBN match |
+| `MIN_CONTENT_LEN` | 200 | Min normalized chars; below this, no fingerprint is stored |
+
+Extraction tools: `pdftotext` (PDF, first 5 pages), `djvutxt` (DjVu, first 5 pages), `zipfile` + HTML stripping (EPUB spine order), `ebook-convert` (MOBI, AZW3, CHM).
+
+Match reasons in `fuzzy_duplicates.txt`:
+- `content_hash` — normalized extracted text is byte-for-byte identical
+- `isbn` — checksummed ISBN found near "ISBN" label, confirmed by title + text similarity
+- `fuzzy_text` — title-blocked pairs with SequenceMatcher ≥ 0.85
 
 ## Extending categories
 
