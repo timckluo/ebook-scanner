@@ -1,4 +1,6 @@
 books.db
 duplicates.txt
 report.txt
+fuzzy_duplicates.txt
 .claude/
+prompts.md
