@@ -41,6 +41,11 @@ MAX_WORKERS  = 16
 SAMPLE_CHARS = 3000   # characters to extract per book
 FUZZY_THRESH = 0.85   # SequenceMatcher ratio threshold
 
+# Extended-version detection: one file has significantly more pages
+# than the other in the same duplicate group.
+EXTENDED_PAGE_RATIO = 1.15   # larger / smaller page count
+EXTENDED_PAGE_DIFF  = 30     # AND absolute difference (pages)
+
 
 # ── Text extraction ───────────────────────────────────────────────────────────
 
@@ -133,6 +138,45 @@ EXTRACTORS = {
 }
 
 
+def get_page_count(path: str, fmt: str) -> int | None:
+    """Return total page/section count for the book, or None if unavailable."""
+    if fmt == 'pdf':
+        out = _run(['pdfinfo', path])
+        for line in out.splitlines():
+            if line.startswith('Pages:'):
+                try:
+                    return int(line.split()[1])
+                except (IndexError, ValueError):
+                    pass
+    elif fmt == 'djvu':
+        out = _run(['djvused', path, '-e', 'n'])
+        try:
+            return int(out.strip())
+        except ValueError:
+            pass
+    elif fmt == 'epub':
+        try:
+            with zipfile.ZipFile(path) as z:
+                container = z.read('META-INF/container.xml').decode('utf-8', errors='replace')
+                m = re.search(r'full-path="([^"]+)"', container)
+                if m:
+                    opf = z.read(m.group(1)).decode('utf-8', errors='replace')
+                    idrefs = re.findall(r'<itemref\b[^>]*\bidref="([^"]*)"', opf)
+                    if idrefs:
+                        return len(idrefs)
+        except Exception:
+            pass
+    # MOBI / AZW3 / CHM: try ebook-meta "Number of pages" field
+    elif fmt in ('mobi', 'azw3', 'chm'):
+        out = _run(['ebook-meta', path], timeout=15)
+        for line in out.splitlines():
+            if 'number of pages' in line.lower() or 'pages' in line.lower()[:15]:
+                m = re.search(r':\s*(\d+)', line)
+                if m:
+                    return int(m.group(1))
+    return None
+
+
 # ── Normalisation & fingerprinting ────────────────────────────────────────────
 
 # Must appear near an "ISBN" label to reduce accidental matches
@@ -197,10 +241,13 @@ def content_hash(text: str) -> str | None:
 # ── Per-book processing ───────────────────────────────────────────────────────
 
 def process_book(row: tuple) -> dict:
-    """Extract content fingerprint for one book row from the DB."""
+    """Extract content fingerprint and page count for one book row from the DB."""
     book_id, path, fmt = row
+    if not os.path.isfile(path):
+        return {'id': book_id, 'content_sample': None, 'content_hash': None,
+                'isbn': None, 'pub_year': None, 'page_count': None}
     extractor = EXTRACTORS.get(fmt)
-    raw = extractor(path) if extractor and os.path.isfile(path) else ''
+    raw    = extractor(path) if extractor else ''
     sample = raw[:SAMPLE_CHARS] if raw else ''
     return {
         'id':             book_id,
@@ -208,6 +255,7 @@ def process_book(row: tuple) -> dict:
         'content_hash':   content_hash(sample) if sample else None,
         'isbn':           extract_isbn(sample) if sample else None,
         'pub_year':       extract_year(sample) if sample else None,
+        'page_count':     get_page_count(path, fmt),
     }
 
 
@@ -236,6 +284,7 @@ def upgrade_schema(conn: sqlite3.Connection):
         ('content_hash',   'TEXT'),
         ('isbn',           'TEXT'),
         ('pub_year',       'TEXT'),
+        ('page_count',     'INTEGER'),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE books ADD COLUMN {col} {defn}")
@@ -249,7 +298,8 @@ def upsert_content(conn: sqlite3.Connection, records: list[dict]):
         SET content_sample = :content_sample,
             content_hash   = :content_hash,
             isbn           = :isbn,
-            pub_year       = :pub_year
+            pub_year       = :pub_year,
+            page_count     = :page_count
         WHERE id = :id
     """, records)
     conn.commit()
@@ -403,6 +453,31 @@ def find_fuzzy_duplicates(conn: sqlite3.Connection) -> list[tuple]:
                     entries.append((p, fmt, 'fuzzy_text', round(best, 3)))
                 groups[gid] = entries
 
+    # ── Pass 4: page-count check — reclassify as extended_version ────────────
+    # Fetch page counts from DB for all grouped paths
+    all_grouped_paths = list({p for g in groups.values() for p, *_ in g})
+    placeholders = ','.join('?' * len(all_grouped_paths))
+    pc_rows = conn.execute(
+        f"SELECT path, page_count FROM books WHERE path IN ({placeholders})",
+        all_grouped_paths,
+    ).fetchall()
+    page_count_by_path: dict[str, int | None] = {r[0]: r[1] for r in pc_rows}
+
+    for gid, entries in list(groups.items()):
+        counts = [(p, page_count_by_path.get(p)) for p, *_ in entries]
+        known  = [(p, c) for p, c in counts if c is not None and c > 0]
+        if len(known) < 2:
+            continue
+        min_p = min(c for _, c in known)
+        max_p = max(c for _, c in known)
+        if max_p == 0:
+            continue
+        ratio = max_p / min_p
+        diff  = max_p - min_p
+        if ratio >= EXTENDED_PAGE_RATIO and diff >= EXTENDED_PAGE_DIFF:
+            groups[gid] = [(p, fmt, 'extended_version', sim)
+                           for p, fmt, _, sim in entries]
+
     # Flatten to list of tuples
     result = []
     for gid, entries in groups.items():
@@ -419,35 +494,70 @@ def write_output(conn: sqlite3.Connection, records: list[tuple]):
     for gid, fmt, path, reason, sim in records:
         by_group[gid].append((fmt, path, reason, sim))
 
-    reason_order = {'content_hash': 0, 'isbn': 1, 'fuzzy_text': 2}
+    reason_order = {'content_hash': 0, 'isbn': 1, 'fuzzy_text': 2, 'extended_version': 3}
     sorted_groups = sorted(by_group.items(),
                            key=lambda kv: reason_order.get(kv[1][0][2], 9))
 
-    hash_groups  = sum(1 for g in by_group.values() if g[0][2] == 'content_hash')
-    isbn_groups  = sum(1 for g in by_group.values() if g[0][2] == 'isbn')
-    fuzzy_groups = sum(1 for g in by_group.values() if g[0][2] == 'fuzzy_text')
-    total_files  = len(records)
+    hash_groups     = sum(1 for g in by_group.values() if g[0][2] == 'content_hash')
+    isbn_groups     = sum(1 for g in by_group.values() if g[0][2] == 'isbn')
+    fuzzy_groups    = sum(1 for g in by_group.values() if g[0][2] == 'fuzzy_text')
+    extended_groups = sum(1 for g in by_group.values() if g[0][2] == 'extended_version')
+    total_files     = len(records)
+
+    # Fetch page counts for all paths in the output
+    all_paths = [path for _, _, path, _, _ in records]
+    placeholders = ','.join('?' * len(all_paths))
+    pc_map: dict[str, int | None] = {}
+    if all_paths:
+        for p, c in conn.execute(
+            f"SELECT path, page_count FROM books WHERE path IN ({placeholders})",
+            all_paths,
+        ):
+            pc_map[p] = c
 
     with open(OUT_PATH, 'w') as f:
         f.write(f"# Content-based duplicate ebooks — {datetime.now()}\n")
         f.write(f"# {total_files} files across {len(by_group)} groups\n")
-        f.write(f"# content_hash:{hash_groups}  isbn:{isbn_groups}  fuzzy_text:{fuzzy_groups}\n")
+        f.write(f"# content_hash:{hash_groups}  isbn:{isbn_groups}  "
+                f"fuzzy_text:{fuzzy_groups}  extended_version:{extended_groups}\n")
         f.write("#\n")
         f.write("# Match reasons:\n")
-        f.write("#   content_hash — byte-different files with identical extracted text\n")
-        f.write("#   isbn         — same ISBN number found in copyright pages\n")
-        f.write("#   fuzzy_text   — text similarity ≥ 85% (same content, different encoding/watermark)\n\n")
+        f.write("#   content_hash     — byte-different files with identical extracted text\n")
+        f.write("#   isbn             — same ISBN found in copyright pages (title + text confirmed)\n")
+        f.write("#   fuzzy_text       — text similarity ≥ 85% (same content, different encoding/source)\n")
+        f.write("#   extended_version — front matter matched but page counts differ significantly;\n")
+        f.write("#                      the longer file likely has a supplement or addendum added.\n")
+        f.write("#                      DO NOT delete the longer file without checking its extra pages.\n\n")
 
         for gid, entries in sorted_groups:
             fmt    = entries[0][0]
             reason = entries[0][2]
             sim    = max(e[3] for e in entries)
-            f.write(f"### [{fmt.upper()}] {reason}  sim={sim:.2f}  ({gid})\n")
-            for _, path, _, esim in sorted(entries, key=lambda x: x[1]):
-                f.write(f"  {path}\n")
+
+            # Collect page counts for this group
+            counts = {p: pc_map.get(p) for _, p, _, _ in entries}
+            known  = [c for c in counts.values() if c]
+            pages_note = ''
+            if known:
+                pages_note = f'  pages: {min(known)}–{max(known)}'
+
+            f.write(f"### [{fmt.upper()}] {reason}  sim={sim:.2f}{pages_note}  ({gid})\n")
+
+            # Sort: for extended_version, show shortest first (base), longest last (extended)
+            def sort_key(e):
+                _, p, _, _ = e
+                return (pc_map.get(p) or 0, p)
+
+            for _, path, _, _ in sorted(entries, key=sort_key):
+                pc = pc_map.get(path)
+                pc_str = f'  [{pc} pp]' if pc else ''
+                marker = '  ← extended/longer' if (
+                    reason == 'extended_version' and pc and known and pc == max(known)
+                ) else ''
+                f.write(f"  {path}{pc_str}{marker}\n")
             f.write('\n')
 
-    return hash_groups, isbn_groups, fuzzy_groups, len(by_group)
+    return hash_groups, isbn_groups, fuzzy_groups, extended_groups, len(by_group)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -459,39 +569,72 @@ def main():
     conn.execute("PRAGMA journal_mode=WAL")
     upgrade_schema(conn)
 
-    # Which books still need content extraction?
-    pending = conn.execute("""
-        SELECT id, path, format FROM books
-        WHERE  content_sample IS NULL
+    # Books needing full extraction (no content yet)
+    need_text = conn.execute("""
+        SELECT id, path, format FROM books WHERE content_sample IS NULL
     """).fetchall()
-    print(f"    {len(pending)} books need content extraction "
-          f"({conn.execute('SELECT COUNT(*) FROM books WHERE content_sample IS NOT NULL').fetchone()[0]} already done)")
+    # Books that have content but no page count yet
+    need_pages = conn.execute("""
+        SELECT id, path, format FROM books
+        WHERE  content_sample IS NOT NULL AND page_count IS NULL
+    """).fetchall()
 
-    if pending:
-        done, total, batch = 0, len(pending), []
-        BATCH_N = 100
+    print(f"    {len(need_text)} need full extraction, "
+          f"{len(need_pages)} need page count only, "
+          f"{conn.execute('SELECT COUNT(*) FROM books WHERE content_sample IS NOT NULL AND page_count IS NOT NULL').fetchone()[0]} already complete")
 
+    def flush(records):
+        upsert_content(conn, records)
+
+    # Full extraction pass
+    if need_text:
+        done, total, batch = 0, len(need_text), []
+        print(f"[…] Extracting content for {total} new books …")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
-            futures = {exe.submit(process_book, row): row for row in pending}
+            futures = {exe.submit(process_book, row): row for row in need_text}
             for fut in as_completed(futures):
                 done += 1
                 if done % 500 == 0 or done == total:
                     print(f"    {done}/{total} ({done/total*100:.1f}%) …", flush=True)
                 try:
-                    rec = fut.result()
-                    batch.append(rec)
+                    batch.append(fut.result())
                 except Exception as exc:
                     print(f"    [warn] {futures[fut][1]}: {exc}", file=sys.stderr)
-                if len(batch) >= BATCH_N:
-                    upsert_content(conn, batch)
-                    batch.clear()
+                if len(batch) >= 100:
+                    flush(batch); batch.clear()
         if batch:
-            upsert_content(conn, batch)
+            flush(batch)
 
-        extracted = conn.execute(
-            "SELECT COUNT(*) FROM books WHERE content_sample IS NOT NULL"
-        ).fetchone()[0]
-        print(f"    Extraction done: {extracted} books have content samples.")
+    # Page-count-only pass (don't touch content_sample / content_hash)
+    if need_pages:
+        print(f"[…] Fetching page counts for {len(need_pages)} books …")
+
+        def fetch_page_count(row):
+            book_id, path, fmt = row
+            return {'id': book_id, 'page_count': get_page_count(path, fmt)}
+
+        done, batch = 0, []
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+            futures = {exe.submit(fetch_page_count, row): row for row in need_pages}
+            for fut in as_completed(futures):
+                done += 1
+                if done % 500 == 0 or done == len(need_pages):
+                    print(f"    {done}/{len(need_pages)} ({done/len(need_pages)*100:.1f}%) …", flush=True)
+                try:
+                    batch.append(fut.result())
+                except Exception as exc:
+                    print(f"    [warn] {futures[fut][1]}: {exc}", file=sys.stderr)
+                if len(batch) >= 100:
+                    conn.executemany("UPDATE books SET page_count=:page_count WHERE id=:id", batch)
+                    conn.commit(); batch.clear()
+        if batch:
+            conn.executemany("UPDATE books SET page_count=:page_count WHERE id=:id", batch)
+            conn.commit()
+
+    extracted = conn.execute(
+        "SELECT COUNT(*) FROM books WHERE content_sample IS NOT NULL"
+    ).fetchone()[0]
+    print(f"    {extracted} books have content samples.")
 
     # Find duplicates
     print("[…] Finding content-based duplicates …")
@@ -506,12 +649,12 @@ def main():
         conn.commit()
 
     print(f"[…] Writing → {OUT_PATH}")
-    h, i, f_cnt, g = write_output(conn, records)
+    h, i, f_cnt, ext, g = write_output(conn, records)
 
     conn.close()
     print(f"\n[{datetime.now():%H:%M:%S}] Done.")
     print(f"  {g} duplicate groups  "
-          f"(content_hash:{h}  isbn:{i}  fuzzy_text:{f_cnt})")
+          f"(content_hash:{h}  isbn:{i}  fuzzy_text:{f_cnt}  extended_version:{ext})")
     print(f"  {len(records)} total files listed in {OUT_PATH}")
 
 
