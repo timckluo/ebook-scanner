@@ -7,16 +7,25 @@ Strategy (applied per format):
   1. Content-hash match  — same normalized extracted text → identical content
   2. ISBN match          — same ISBN number found in copyright pages
   3. Fuzzy-text match    — SequenceMatcher ratio ≥ 0.85 within title-blocked groups
+  4. Extended-version    — same front matter but significantly more pages
 
-Extraction tools:
+Text extraction tools:
   PDF   → pdftotext (first 5 pages)
   DjVu  → djvutxt   (first 5 pages)
   EPUB  → zipfile + HTML stripping (spine order, first 3000 chars)
   MOBI / AZW3 / CHM → calibre ebook-convert → txt (first 3000 chars)
 
-New DB columns added to 'books': content_sample, content_hash, isbn, pub_year
-New DB table: fuzzy_duplicates
-New output file: fuzzy_duplicates.txt
+OCR fallback for image-based PDF/DjVu (when text extraction yields < 200 chars):
+  PDF   → pdftoppm → tesseract
+  DjVu  → ddjvu   → tesseract
+  Language detected from: DB language field → path keywords → CJK chars in filename
+  Available language packs used: chi_sim, chi_tra, deu, eng, fra, jpn, kor, rus, spa
+  Post-OCR script detected via Unicode block analysis (no OSD traineddata required).
+
+New DB columns: content_sample, content_hash, isbn, pub_year, page_count,
+                ocr_applied, detected_language
+New DB table:   fuzzy_duplicates
+New output:     fuzzy_duplicates.txt
 """
 
 import difflib
@@ -45,6 +54,14 @@ FUZZY_THRESH = 0.85   # SequenceMatcher ratio threshold
 # than the other in the same duplicate group.
 EXTENDED_PAGE_RATIO = 1.15   # larger / smaller page count
 EXTENDED_PAGE_DIFF  = 30     # AND absolute difference (pages)
+
+# OCR fallback for image-based ebooks
+OCR_MAX_PAGES    = 6    # pages to OCR per book
+OCR_PAGE_MIN     = 30   # minimum chars per page to count as useful
+# Tesseract language packs confirmed installed on this system
+_INSTALLED_LANGS = frozenset(
+    {'chi_sim', 'chi_tra', 'deu', 'eng', 'fra', 'jpn', 'kor', 'rus', 'spa'}
+)
 
 
 # ── Text extraction ───────────────────────────────────────────────────────────
@@ -177,6 +194,188 @@ def get_page_count(path: str, fmt: str) -> int | None:
     return None
 
 
+# ── OCR for image-based ebooks ────────────────────────────────────────────────
+
+def _avail_langs(codes: str) -> str:
+    """Return only the '+'-joined lang codes that are actually installed."""
+    parts = [c for c in codes.split('+') if c in _INSTALLED_LANGS]
+    return '+'.join(parts) if parts else 'eng'
+
+
+def _detect_ocr_lang(path: str, db_language: str | None) -> tuple[str, int]:
+    """
+    Return (tesseract_lang_string, dpi) for this book.
+    Priority: DB language field → CJK chars in path → path keywords → default Latin.
+    DPI is 300 for CJK scripts (tesseract needs higher resolution), 200 otherwise.
+    """
+    path_l = path.lower()
+
+    def cjk_pack():
+        return _avail_langs('chi_sim+chi_tra+jpn+kor'), 300
+
+    # 1. DB language field
+    if db_language:
+        tag = re.split(r'[,\-_\s]', db_language.lower())[0]
+        for prefix, codes, dpi in [
+            ('zho', 'chi_sim+chi_tra', 300), ('zh',  'chi_sim+chi_tra', 300),
+            ('chi', 'chi_sim+chi_tra', 300),
+            ('jpn', 'jpn+chi_sim+chi_tra', 300), ('ja', 'jpn+chi_sim+chi_tra', 300),
+            ('kor', 'kor', 300),               ('ko', 'kor', 300),
+            ('rus', 'rus', 200),               ('ru', 'rus', 200),
+            ('fra', 'fra+eng', 200),           ('fr', 'fra+eng', 200),
+            ('deu', 'deu+eng', 200),           ('de', 'deu+eng', 200),
+            ('spa', 'spa+eng', 200),           ('es', 'spa+eng', 200),
+        ]:
+            if tag.startswith(prefix):
+                return _avail_langs(codes), dpi
+
+    # 2. CJK / Japanese / Korean characters anywhere in the path
+    if any('一' <= c <= '鿿' or '぀' <= c <= 'ヿ' or
+           '가' <= c <= '힯' for c in path):
+        return cjk_pack()
+
+    # 3. Directory keywords
+    for kw, codes, dpi in [
+        ('/chinese',   'chi_sim+chi_tra', 300),
+        ('/mandarin',  'chi_sim+chi_tra', 300),
+        ('/cantonese', 'chi_sim+chi_tra', 300),
+        ('/amoy',      'chi_sim+chi_tra', 300),
+        ('/chaozhou',  'chi_sim+chi_tra', 300),
+        ('/sinolog',   'chi_sim+chi_tra', 300),
+        ('/japanese',  'jpn+chi_sim+chi_tra', 300),
+        ('/korean',    'kor', 300),
+        ('/russian',   'rus', 200),
+        ('/french',    'fra+eng', 200),
+        ('/german',    'deu+eng', 200),
+        ('/spanish',   'spa+eng', 200),
+    ]:
+        if kw in path_l:
+            return _avail_langs(codes), dpi
+
+    # 4. Default: all available Latin-script packs
+    return _avail_langs('eng+fra+deu+spa+rus'), 200
+
+
+def _detect_script(text: str) -> str | None:
+    """
+    Identify dominant Unicode script block in OCR output.
+    Returns a BCP-47-like tag ('zh', 'ja', 'ko', 'ru', 'en') or None.
+    No external libraries required — uses Unicode code-point ranges.
+    """
+    cjk = jpn = kor = arabic = cyrillic = latin = 0
+    for ch in text:
+        cp = ord(ch)
+        if 0x4e00 <= cp <= 0x9fff or 0x3400 <= cp <= 0x4dbf:
+            cjk += 1
+        elif 0x3040 <= cp <= 0x30ff:   # hiragana + katakana
+            jpn += 1
+        elif 0xac00 <= cp <= 0xd7af:   # hangul syllables
+            kor += 1
+        elif 0x0600 <= cp <= 0x06ff:
+            arabic += 1
+        elif 0x0400 <= cp <= 0x04ff:
+            cyrillic += 1
+        elif ch.isascii() and ch.isalpha():
+            latin += 1
+
+    total = cjk + jpn + kor + arabic + cyrillic + latin
+    if total < 30:
+        return None
+
+    # Japanese uses CJK + kana; Korean is pure hangul
+    scores = [('zh', cjk), ('ja', jpn), ('ko', kor),
+              ('ar', arabic), ('ru', cyrillic), ('en', latin)]
+    best_tag, best_n = max(scores, key=lambda x: x[1])
+    # CJK ideographs appear in both Chinese and Japanese — prefer 'ja' if kana present
+    if best_tag == 'zh' and jpn > total * 0.05:
+        best_tag = 'ja'
+    return best_tag if best_n / total >= 0.20 else None
+
+
+def _tesseract_pages(images: list[str], lang: str, dpi: int) -> str:
+    """Run tesseract on a list of image paths; return combined text up to SAMPLE_CHARS."""
+    texts = []
+    for img in images:
+        out = _run(
+            ['tesseract', img, '-', '--psm', '6', '--dpi', str(dpi), '-l', lang],
+            timeout=60,
+        )
+        page_text = out.strip()
+        if len(page_text) >= OCR_PAGE_MIN:
+            texts.append(page_text)
+        if sum(len(t) for t in texts) >= SAMPLE_CHARS:
+            break
+    return '\n'.join(texts)[:SAMPLE_CHARS]
+
+
+def _ocr_pdf(path: str, lang: str, dpi: int) -> str:
+    with tempfile.TemporaryDirectory() as d:
+        prefix = os.path.join(d, 'p')
+        _run(['pdftoppm', '-r', str(dpi), '-l', str(OCR_MAX_PAGES), path, prefix])
+        imgs = sorted(
+            os.path.join(d, f) for f in os.listdir(d) if f.endswith('.ppm')
+        )
+        return _tesseract_pages(imgs, lang, dpi)
+
+
+def _ocr_djvu(path: str, lang: str, dpi: int) -> str:
+    # ddjvu -eachpage uses %d formatting; simpler to do one page at a time
+    texts = []
+    with tempfile.TemporaryDirectory() as d:
+        for pg in range(1, OCR_MAX_PAGES + 1):
+            img = os.path.join(d, f'page_{pg:03d}.ppm')
+            _run(['ddjvu', '-format=ppm', f'-scale={dpi}',
+                  f'-page={pg}', path, img])
+            if not os.path.exists(img):
+                break
+            out = _run(
+                ['tesseract', img, '-', '--psm', '6', '--dpi', str(dpi), '-l', lang],
+                timeout=60,
+            )
+            page_text = out.strip()
+            if len(page_text) >= OCR_PAGE_MIN:
+                texts.append(page_text)
+            if sum(len(t) for t in texts) >= SAMPLE_CHARS:
+                break
+    return '\n'.join(texts)[:SAMPLE_CHARS]
+
+
+_OCR_EXTRACTORS = {'pdf': _ocr_pdf, 'djvu': _ocr_djvu}
+
+
+def ocr_process_book(row: tuple) -> dict:
+    """OCR one image-based book. row = (id, path, fmt, db_language)."""
+    book_id, path, fmt, db_language = row
+    result = {'id': book_id, 'content_sample': None, 'content_hash': None,
+              'ocr_applied': 1, 'detected_language': None}
+    if not os.path.isfile(path):
+        return result
+
+    extractor = _OCR_EXTRACTORS.get(fmt)
+    if not extractor:
+        return result
+
+    lang, dpi = _detect_ocr_lang(path, db_language)
+    raw = extractor(path, lang, dpi)
+
+    # If the Latin pass returned too little text, try CJK as a fallback
+    if len(raw.strip()) < OCR_PAGE_MIN * 2 and 'chi_sim' not in lang:
+        cjk_lang = _avail_langs('chi_sim+chi_tra+jpn+kor')
+        raw_cjk  = extractor(path, cjk_lang, 300)
+        if len(raw_cjk.strip()) > len(raw.strip()):
+            raw = raw_cjk
+
+    detected = _detect_script(raw) if raw else None
+    sample   = raw[:SAMPLE_CHARS] if raw.strip() else None
+
+    result.update({
+        'content_sample':    sample,
+        'content_hash':      content_hash(sample) if sample else None,
+        'detected_language': detected,
+    })
+    return result
+
+
 # ── Normalisation & fingerprinting ────────────────────────────────────────────
 
 # Must appear near an "ISBN" label to reduce accidental matches
@@ -280,11 +479,13 @@ CREATE INDEX IF NOT EXISTS idx_isbn          ON books(isbn);
 def upgrade_schema(conn: sqlite3.Connection):
     existing = {r[1] for r in conn.execute("PRAGMA table_info(books)")}
     for col, defn in [
-        ('content_sample', 'TEXT'),
-        ('content_hash',   'TEXT'),
-        ('isbn',           'TEXT'),
-        ('pub_year',       'TEXT'),
-        ('page_count',     'INTEGER'),
+        ('content_sample',    'TEXT'),
+        ('content_hash',      'TEXT'),
+        ('isbn',              'TEXT'),
+        ('pub_year',          'TEXT'),
+        ('page_count',        'INTEGER'),
+        ('ocr_applied',       'INTEGER DEFAULT 0'),
+        ('detected_language', 'TEXT'),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE books ADD COLUMN {col} {defn}")
@@ -527,7 +728,9 @@ def write_output(conn: sqlite3.Connection, records: list[tuple]):
         f.write("#   fuzzy_text       — text similarity ≥ 85% (same content, different encoding/source)\n")
         f.write("#   extended_version — front matter matched but page counts differ significantly;\n")
         f.write("#                      the longer file likely has a supplement or addendum added.\n")
-        f.write("#                      DO NOT delete the longer file without checking its extra pages.\n\n")
+        f.write("#                      DO NOT delete the longer file without checking its extra pages.\n")
+        f.write("# Note: groups marked [ocr] were matched via OCR-extracted text "
+                "(image-based scans).\n\n")
 
         for gid, entries in sorted_groups:
             fmt    = entries[0][0]
@@ -541,7 +744,15 @@ def write_output(conn: sqlite3.Connection, records: list[tuple]):
             if known:
                 pages_note = f'  pages: {min(known)}–{max(known)}'
 
-            f.write(f"### [{fmt.upper()}] {reason}  sim={sim:.2f}{pages_note}  ({gid})\n")
+            # Check if any file in this group used OCR
+            group_paths = [p for _, p, _, _ in entries]
+            placeholders_g = ','.join('?' * len(group_paths))
+            ocr_count = conn.execute(
+                f"SELECT COUNT(*) FROM books WHERE ocr_applied=1 AND path IN ({placeholders_g})",
+                group_paths,
+            ).fetchone()[0]
+            ocr_note = '  [ocr]' if ocr_count else ''
+            f.write(f"### [{fmt.upper()}] {reason}{ocr_note}  sim={sim:.2f}{pages_note}  ({gid})\n")
 
             # Sort: for extended_version, show shortest first (base), longest last (extended)
             def sort_key(e):
@@ -558,6 +769,80 @@ def write_output(conn: sqlite3.Connection, records: list[tuple]):
             f.write('\n')
 
     return hash_groups, isbn_groups, fuzzy_groups, extended_groups, len(by_group)
+
+
+# ── OCR pass ─────────────────────────────────────────────────────────────────
+
+def run_ocr_pass(conn: sqlite3.Connection) -> int:
+    """
+    Run OCR on image-based PDF/DjVu books that still have no content fingerprint.
+    Candidates: page_count > 0, content_hash IS NULL, OCR not yet attempted.
+    Writes content_sample, content_hash, ocr_applied, detected_language back to DB.
+    Returns the count of books processed.
+    """
+    candidates = conn.execute("""
+        SELECT id, path, format, language FROM books
+        WHERE  page_count > 0
+          AND  content_hash IS NULL
+          AND  format IN ('pdf', 'djvu')
+          AND  (ocr_applied IS NULL OR ocr_applied = 0)
+        ORDER  BY page_count
+    """).fetchall()
+
+    if not candidates:
+        print("    No image-based books needing OCR.")
+        return 0
+
+    print(f"[…] OCR: {len(candidates)} image-based books (pdf/djvu with no extractable text) …")
+    done, total = 0, len(candidates)
+    batch: list[dict] = []
+    BATCH_N = 10
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exe:
+        futures = {exe.submit(ocr_process_book, row): row for row in candidates}
+        for fut in as_completed(futures):
+            done += 1
+            if done % 50 == 0 or done == total:
+                print(f"    {done}/{total} ({done/total*100:.1f}%) …", flush=True)
+            try:
+                batch.append(fut.result())
+            except Exception as exc:
+                row = futures[fut]
+                print(f"    [warn] {row[1]}: {exc}", file=sys.stderr)
+            if len(batch) >= BATCH_N:
+                conn.executemany("""
+                    UPDATE books
+                    SET content_sample    = :content_sample,
+                        content_hash      = :content_hash,
+                        ocr_applied       = :ocr_applied,
+                        detected_language = :detected_language
+                    WHERE id = :id
+                """, batch)
+                conn.commit()
+                batch.clear()
+
+    if batch:
+        conn.executemany("""
+            UPDATE books
+            SET content_sample    = :content_sample,
+                content_hash      = :content_hash,
+                ocr_applied       = :ocr_applied,
+                detected_language = :detected_language
+            WHERE id = :id
+        """, batch)
+        conn.commit()
+
+    succeeded = conn.execute(
+        "SELECT COUNT(*) FROM books WHERE ocr_applied=1 AND content_hash IS NOT NULL"
+    ).fetchone()[0]
+    langs = conn.execute(
+        "SELECT detected_language, COUNT(*) FROM books "
+        "WHERE ocr_applied=1 AND detected_language IS NOT NULL "
+        "GROUP BY detected_language ORDER BY 2 DESC"
+    ).fetchall()
+    print(f"    OCR done: {succeeded} books got fingerprints. "
+          f"Languages detected: {dict(langs) if langs else 'none'}")
+    return done
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -635,6 +920,9 @@ def main():
         "SELECT COUNT(*) FROM books WHERE content_sample IS NOT NULL"
     ).fetchone()[0]
     print(f"    {extracted} books have content samples.")
+
+    # OCR pass — image-based PDF/DjVu with no usable text yet
+    run_ocr_pass(conn)
 
     # Find duplicates
     print("[…] Finding content-based duplicates …")

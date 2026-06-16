@@ -56,13 +56,19 @@ Both scripts are resumable — already-processed files are skipped.
 | `ISBN_TEXT_SIM` | 0.75 | Min text similarity to confirm an ISBN match |
 | `ISBN_TITLE_SIM` | 0.70 | Min title similarity to confirm an ISBN match |
 | `MIN_CONTENT_LEN` | 200 | Min normalized chars; below this, no fingerprint is stored |
+| `OCR_MAX_PAGES` | 6 | Max pages to OCR per book |
+| `EXTENDED_PAGE_RATIO` | 1.15 | Page ratio threshold to flag as extended version |
+| `EXTENDED_PAGE_DIFF` | 30 | Min page difference to flag as extended version |
 
 Extraction tools: `pdftotext` (PDF, first 5 pages), `djvutxt` (DjVu, first 5 pages), `zipfile` + HTML stripping (EPUB spine order), `ebook-convert` (MOBI, AZW3, CHM).
+
+**OCR fallback**: Image-based PDFs and DjVu files (where text extraction yields nothing) are processed with `tesseract 5.x`. Language is auto-detected from the DB language field, CJK characters in the file path, or path keywords (`/chinese/`, `/japanese/`, etc.). Script detection uses Unicode block analysis (no external libs). Installed language packs: `chi_sim, chi_tra, deu, eng, fra, jpn, kor, rus, spa`. Groups matched via OCR are tagged `[ocr]` in output.
 
 Match reasons in `fuzzy_duplicates.txt`:
 - `content_hash` — normalized extracted text is byte-for-byte identical
 - `isbn` — checksummed ISBN found near "ISBN" label, confirmed by title + text similarity
 - `fuzzy_text` — title-blocked pairs with SequenceMatcher ≥ 0.85
+- `extended_version` — front matter matches but page counts differ by ≥15% and ≥30 pages; longer file likely has a supplement/addendum — **do not delete without reviewing**
 
 ## Extending categories
 
